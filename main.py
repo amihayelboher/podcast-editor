@@ -1,8 +1,9 @@
 import os
 
-from audio_denoise import remove_static_noise_from_video
+from audio_denoise import denoise_video
 
-INPUT_VIDEO = "test_non_static_noise.mp4"
+VIDEO_FOLDER = "test_videos"
+INPUT_VIDEO = "non_static_noise.mp4"
 
 
 def output_path_for(input_path: str) -> str:
@@ -11,8 +12,9 @@ def output_path_for(input_path: str) -> str:
 
 
 def main() -> None:
-    output_video = output_path_for(INPUT_VIDEO)
-    remove_static_noise_from_video(INPUT_VIDEO, output_video, device="cuda")
+    input_path = os.path.join(VIDEO_FOLDER, INPUT_VIDEO)
+    output_video = output_path_for(input_path)
+    denoise_video(input_path, output_video, methods=["static"])
 
 
 if __name__ == "__main__":
