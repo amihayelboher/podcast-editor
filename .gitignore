@@ -219,3 +219,6 @@ __marimo__/
 
 # videos
 *.mp4
+
+# test videos folder
+test_videos/
