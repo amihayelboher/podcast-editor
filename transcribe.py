@@ -1,4 +1,4 @@
-"""Stage 1 transcription: word-level timestamps via faster-whisper (or openai-whisper)."""
+"""Stage 1 transcription: WhisperX ASR + forced word-level alignment (CUDA)."""
 
 from __future__ import annotations
 
@@ -7,187 +7,346 @@ import os
 import time
 from typing import Any
 
-# Prefer faster-whisper; fall back to openai-whisper.
-_BACKEND: str | None = None
-try:
-    from faster_whisper import WhisperModel  # type: ignore
 
-    _BACKEND = "faster-whisper"
-except ImportError:
+def _require_whisperx():
     try:
-        import whisper as openai_whisper  # type: ignore
-
-        _BACKEND = "openai-whisper"
-    except ImportError:
-        openai_whisper = None  # type: ignore
-
-
-def _require_backend() -> str:
-    if _BACKEND is None:
+        import whisperx  # type: ignore
+    except ImportError as exc:
         raise ImportError(
-            "No Whisper backend found. Install one of:\n"
-            "  pip install faster-whisper\n"
-            "  pip install openai-whisper"
-        )
-    return _BACKEND
+            "whisperx is required for word-level forced alignment.\n"
+            "  pip install whisperx\n"
+            "Requires PyTorch with CUDA for GPU acceleration."
+        ) from exc
+    return whisperx
 
 
-def _normalize_word(word: str, start: float, end: float, probability: float) -> dict[str, Any]:
-    return {
-        "word": word,
-        "start": float(start),
-        "end": float(end),
-        "probability": float(probability),
-    }
+def _resolve_device(prefer_cuda: bool = True) -> tuple[str, str]:
+    """
+    Return (device, preferred_compute_type) for WhisperX.
+
+    GPU uses float16 (with int8 OOM fallback at load time); CPU uses int8.
+    """
+    try:
+        import torch
+    except ImportError:
+        return "cpu", "int8"
+
+    if prefer_cuda and torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        print(f"[transcribe] Using CUDA: {name}")
+        return "cuda", "float16"
+
+    print("[transcribe] CUDA not available — using CPU (int8)")
+    return "cpu", "int8"
 
 
-def _transcribe_faster_whisper(
-    path: str,
-    model_size: str,
-    language: str | None,
-) -> dict[str, Any]:
-    device = "cuda"
-    compute_type = "float16"
+def _is_oom_error(exc: BaseException) -> bool:
+    """True if exception looks like CUDA / allocator out-of-memory."""
+    if isinstance(exc, MemoryError):
+        return True
     try:
         import torch
 
-        if not torch.cuda.is_available():
-            device = "cpu"
-            compute_type = "int8"
-    except ImportError:
-        device = "cpu"
-        compute_type = "int8"
-
-    print(f"[transcribe] Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-
-    print("[transcribe] Transcription started (word_timestamps=True)...")
-    t0 = time.perf_counter()
-    segments_iter, info = model.transcribe(
-        path,
-        language=language,
-        word_timestamps=True,
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "out of memory",
+            "cuda out of memory",
+            "cudnn_status_alloc_failed",
+            "failed to allocate",
+        )
     )
 
-    segments: list[dict[str, Any]] = []
+
+def _clear_cuda() -> None:
+    try:
+        import gc
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _load_whisperx_model(
+    whisperx: Any,
+    model_size: str,
+    device: str,
+    compute_type: str,
+    language: str | None,
+    asr_options: dict[str, Any] | None = None,
+) -> tuple[Any, str]:
+    """
+    Load WhisperX ASR model.
+
+    On CUDA OOM with float16, retries once with compute_type=\"int8\".
+    Returns (model, compute_type_used).
+    """
+    kwargs: dict[str, Any] = {
+        "compute_type": compute_type,
+        "language": language,
+    }
+    if asr_options is not None:
+        kwargs["asr_options"] = asr_options
+
+    try:
+        model = whisperx.load_model(model_size, device, **kwargs)
+        return model, compute_type
+    except Exception as exc:
+        if (
+            device == "cuda"
+            and compute_type == "float16"
+            and _is_oom_error(exc)
+        ):
+            print(
+                f"[transcribe] OOM loading model with float16 "
+                f"({exc}); falling back to int8..."
+            )
+            _clear_cuda()
+            kwargs["compute_type"] = "int8"
+            model = whisperx.load_model(model_size, device, **kwargs)
+            return model, "int8"
+        raise
+
+
+def _normalize_word(
+    word: str,
+    start: float,
+    end: float,
+    score: float | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "word": word,
+        "start": float(start),
+        "end": float(end),
+    }
+    if score is not None:
+        item["score"] = float(score)
+        item["probability"] = float(score)
+    return item
+
+
+def _segment_words(seg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize WhisperX word entries from an aligned segment."""
+    words: list[dict[str, Any]] = []
+    for w in seg.get("words") or []:
+        text = w.get("word")
+        if text is None:
+            text = w.get("text", "")
+        # Aligned words may omit start/end when alignment failed for that token.
+        if w.get("start") is None or w.get("end") is None:
+            continue
+        words.append(
+            _normalize_word(
+                str(text),
+                float(w["start"]),
+                float(w["end"]),
+                w.get("score"),
+            )
+        )
+    return words
+
+
+def _normalize_aligned_result(
+    aligned: dict[str, Any],
+    *,
+    language: str | None,
+    model_size: str,
+    device: str,
+    compute_type: str,
+) -> dict[str, Any]:
+    """Convert WhisperX align() output into our stable transcript schema."""
+    segments_out: list[dict[str, Any]] = []
     text_parts: list[str] = []
-    for seg in segments_iter:
-        words = []
-        if seg.words:
-            for w in seg.words:
-                words.append(
-                    _normalize_word(
-                        w.word,
-                        w.start,
-                        w.end,
-                        getattr(w, "probability", 0.0),
-                    )
-                )
-        segment_text = (seg.text or "").strip()
+
+    for seg in aligned.get("segments") or []:
+        words = _segment_words(seg)
+        segment_text = (seg.get("text") or "").strip()
+        if not segment_text and words:
+            segment_text = " ".join(w["word"].strip() for w in words).strip()
         text_parts.append(segment_text)
-        segments.append(
+
+        start = seg.get("start")
+        end = seg.get("end")
+        if start is None and words:
+            start = words[0]["start"]
+        if end is None and words:
+            end = words[-1]["end"]
+
+        segments_out.append(
             {
-                "start": float(seg.start),
-                "end": float(seg.end),
+                "start": float(start or 0.0),
+                "end": float(end or 0.0),
                 "text": segment_text,
                 "words": words,
             }
         )
 
-    elapsed = time.perf_counter() - t0
-    detected = getattr(info, "language", language)
-    print(
-        f"[transcribe] Done in {elapsed:.1f}s"
-        + (f" (detected language: {detected})" if detected else "")
-    )
+    # Prefer word-level full text when available (aligned word list).
+    word_level = aligned.get("word_segments")
+    if word_level:
+        full_text = " ".join(
+            str(w.get("word") or w.get("text") or "").strip()
+            for w in word_level
+            if (w.get("word") or w.get("text"))
+        ).strip()
+    else:
+        full_text = " ".join(p for p in text_parts if p).strip()
+
     return {
-        "text": " ".join(p for p in text_parts if p).strip(),
-        "segments": segments,
-        "language": detected,
-        "backend": "faster-whisper",
+        "text": full_text,
+        "segments": segments_out,
+        "language": language,
+        "backend": "whisperx",
         "model_size": model_size,
-    }
-
-
-def _transcribe_openai_whisper(
-    path: str,
-    model_size: str,
-    language: str | None,
-) -> dict[str, Any]:
-    print(f"[transcribe] Loading openai-whisper model '{model_size}'...")
-    model = openai_whisper.load_model(model_size)
-
-    print("[transcribe] Transcription started (word_timestamps=True)...")
-    t0 = time.perf_counter()
-    kwargs: dict[str, Any] = {"word_timestamps": True, "verbose": False}
-    if language:
-        kwargs["language"] = language
-    result = model.transcribe(path, **kwargs)
-    elapsed = time.perf_counter() - t0
-
-    segments: list[dict[str, Any]] = []
-    for seg in result.get("segments") or []:
-        words = []
-        for w in seg.get("words") or []:
-            words.append(
-                _normalize_word(
-                    w.get("word", ""),
-                    w.get("start", 0.0),
-                    w.get("end", 0.0),
-                    w.get("probability", 0.0),
-                )
-            )
-        segments.append(
-            {
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "text": (seg.get("text") or "").strip(),
-                "words": words,
-            }
-        )
-
-    detected = result.get("language") or language
-    print(
-        f"[transcribe] Done in {elapsed:.1f}s"
-        + (f" (detected language: {detected})" if detected else "")
-    )
-    return {
-        "text": (result.get("text") or "").strip(),
-        "segments": segments,
-        "language": detected,
-        "backend": "openai-whisper",
-        "model_size": model_size,
+        "device": device,
+        "compute_type": compute_type,
+        "aligned": True,
     }
 
 
 def transcribe_audio(
     video_or_audio_path: str,
-    model_size: str = "large-v3",
+    model_size: str = "medium",
     language: str | None = None,
+    *,
+    batch_size: int = 8,
+    prefer_cuda: bool = True,
 ) -> dict[str, Any]:
     """
-    Transcribe video/audio with word-level timestamps.
+    Transcribe with WhisperX, then forced-align for precise word timestamps.
 
-    Uses faster-whisper when available, otherwise openai-whisper.
-    Whisper backends accept video paths directly (ffmpeg extracts audio).
+    Pipeline:
+      1. load_model (float16 on GPU; int8 OOM fallback) + load_audio + transcribe
+      2. load_align_model for the target/detected language
+      3. whisperx.align → hyper-precise word start/end times
 
     Returns
     -------
     dict with keys:
       - text: full transcript
-      - segments: list of {start, end, text, words: [{word, start, end, probability}]}
-      - language, backend, model_size (metadata)
+      - segments: list of {start, end, text, words: [{word, start, end, score?}]}
+      - language, backend=whisperx, model_size, device, compute_type, aligned=True
     """
     if not os.path.exists(video_or_audio_path):
         raise FileNotFoundError(f"Input not found: {video_or_audio_path}")
 
-    backend = _require_backend()
-    print(f"[transcribe] Input: {video_or_audio_path}")
-    print(f"[transcribe] Backend: {backend}")
+    whisperx = _require_whisperx()
+    device, compute_type = _resolve_device(prefer_cuda=prefer_cuda)
 
-    if backend == "faster-whisper":
-        return _transcribe_faster_whisper(video_or_audio_path, model_size, language)
-    return _transcribe_openai_whisper(video_or_audio_path, model_size, language)
+    # Raw decoding: keep fillers/hesitations; avoid prior-window suppression of repeats.
+    asr_options = {
+        "suppress_tokens": [],
+        "condition_on_previous_text": False,
+    }
+
+    print(f"[transcribe] Input: {video_or_audio_path}")
+    print(
+        f"[transcribe] Backend: whisperx | model={model_size} "
+        f"| device={device} | compute_type={compute_type} (preferred)"
+    )
+
+    t0 = time.perf_counter()
+
+    print(f"[transcribe] Loading WhisperX model '{model_size}' ({compute_type})...")
+    print(
+        "[transcribe] ASR options: suppress_tokens=[] "
+        "condition_on_previous_text=False"
+    )
+    model, compute_type = _load_whisperx_model(
+        whisperx,
+        model_size,
+        device,
+        compute_type,
+        language,
+        asr_options=asr_options,
+    )
+    print(f"[transcribe] Model ready (compute_type={compute_type})")
+
+    print("[transcribe] Loading audio...")
+    audio = whisperx.load_audio(video_or_audio_path)
+
+    print("[transcribe] Running ASR (WhisperX)...")
+    try:
+        asr_result = model.transcribe(
+            audio, batch_size=batch_size, language=language
+        )
+    except Exception as exc:
+        # Batch inference can OOM even if load succeeded; retry int8 + smaller batch.
+        if device == "cuda" and compute_type == "float16" and _is_oom_error(exc):
+            print(
+                f"[transcribe] OOM during ASR (batch_size={batch_size}); "
+                "reloading model as int8 with smaller batch..."
+            )
+            del model
+            _clear_cuda()
+            model, compute_type = _load_whisperx_model(
+                whisperx,
+                model_size,
+                device,
+                "int8",
+                language,
+                asr_options=asr_options,
+            )
+            reduced_batch = max(1, batch_size // 2)
+            asr_result = model.transcribe(
+                audio, batch_size=reduced_batch, language=language
+            )
+        else:
+            raise
+
+    detected = asr_result.get("language") or language
+    if not detected:
+        raise RuntimeError(
+            "WhisperX could not detect language; pass language= explicitly "
+            "(e.g. language='en')."
+        )
+    print(f"[transcribe] Detected language: {detected}")
+
+    # Free ASR model VRAM before loading the alignment model (important on 4GB GPUs).
+    del model
+    _clear_cuda()
+
+    print(f"[transcribe] Loading alignment model for '{detected}'...")
+    align_model, align_metadata = whisperx.load_align_model(
+        language_code=detected,
+        device=device,
+    )
+
+    print("[transcribe] Forced word-level alignment...")
+    aligned = whisperx.align(
+        asr_result["segments"],
+        align_model,
+        align_metadata,
+        audio,
+        device,
+        return_char_alignments=False,
+    )
+
+    del align_model
+    _clear_cuda()
+
+    elapsed = time.perf_counter() - t0
+    result = _normalize_aligned_result(
+        aligned,
+        language=detected,
+        model_size=model_size,
+        device=device,
+        compute_type=compute_type,
+    )
+    n_words = sum(len(s.get("words") or []) for s in result["segments"])
+    print(
+        f"[transcribe] Done in {elapsed:.1f}s - "
+        f"{len(result['segments'])} segment(s), {n_words} aligned word(s)"
+    )
+    return result
 
 
 def save_transcription_json(result: dict, output_json_path: str) -> None:
