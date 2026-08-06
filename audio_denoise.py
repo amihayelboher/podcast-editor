@@ -1,5 +1,7 @@
+import argparse
 import os
 import subprocess
+import sys
 import tempfile
 
 import noisereduce as nr
@@ -422,3 +424,74 @@ def denoise_video(
             else:
                 _METHOD_HANDLERS[method](current, stage_out)
             current = stage_out
+
+
+def denoised_path_for(video_path: str) -> str:
+    """Derive ``<stem>_audio_denoised<ext>`` next to the input video."""
+    stem, ext = os.path.splitext(video_path)
+    return f"{stem}_audio_denoised{ext}"
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Denoise video audio (DeepFilterNet / noisereduce / Silero)."
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default=os.path.join("test_videos", "static_noise.mp4"),
+        help="Input video path (default: test_videos/static_noise.mp4)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output video path (default: <stem>_audio_denoised<ext>)",
+    )
+    parser.add_argument(
+        "-m",
+        "--method",
+        dest="methods",
+        action="append",
+        default=None,
+        help=(
+            "Denoise method (repeatable). "
+            "Accepted: static/deepfilter, transients/non-static, silero. "
+            "Default: static"
+        ),
+    )
+    parser.add_argument(
+        "--no-mute-non-speech",
+        action="store_true",
+        help="Skip Silero VAD mute of non-speech gaps (DeepFilterNet only)",
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.65,
+        help="Silero VAD speech threshold (default: 0.65)",
+    )
+    parser.add_argument(
+        "--vad-min-silence-ms",
+        type=int,
+        default=50,
+        help="Min silence (ms) to split speech segments (default: 50)",
+    )
+    args = parser.parse_args()
+
+    input_path = args.input
+    output_path = args.output or denoised_path_for(input_path)
+    methods = args.methods if args.methods else ["static"]
+
+    if not os.path.exists(input_path):
+        print(f"Input not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    denoise_video(
+        input_path,
+        output_path,
+        methods=methods,
+        mute_non_speech_intervals=not args.no_mute_non_speech,
+        threshold=args.vad_threshold,
+        min_silence_duration_ms=args.vad_min_silence_ms,
+    )

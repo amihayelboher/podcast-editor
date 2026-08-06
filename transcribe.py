@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 import time
 from typing import Any
 
@@ -363,3 +365,62 @@ def transcript_path_for(video_or_audio_path: str) -> str:
     """Derive ``<stem>_transcript.json`` next to the input file."""
     stem, _ = os.path.splitext(video_or_audio_path)
     return f"{stem}_transcript.json"
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Transcribe audio/video with WhisperX ASR + forced word alignment."
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default=os.path.join("test_videos", "static_noise_audio_denoised.mp4"),
+        help=(
+            "Input audio or video path "
+            "(default: test_videos/static_noise_audio_denoised.mp4)"
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output JSON path (default: <stem>_transcript.json)",
+    )
+    parser.add_argument(
+        "--model-size",
+        default="medium",
+        help="WhisperX model size (default: medium)",
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="Force language for ASR + alignment (e.g. en, he). Default: auto-detect",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="WhisperX ASR batch size (default: 8)",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU instead of CUDA",
+    )
+    args = parser.parse_args()
+
+    input_path = args.input
+    output_path = args.output or transcript_path_for(input_path)
+
+    if not os.path.exists(input_path):
+        print(f"Input not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    result = transcribe_audio(
+        input_path,
+        model_size=args.model_size,
+        language=args.language,
+        batch_size=args.batch_size,
+        prefer_cuda=not args.cpu,
+    )
+    save_transcription_json(result, output_path)

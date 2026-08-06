@@ -1,83 +1,72 @@
-import argparse
+"""End-to-end podcast editor pipeline orchestrator."""
+
+from __future__ import annotations
+
 import os
+import tempfile
 
 from audio_denoise import denoise_video
-from transcribe import save_transcription_json, transcribe_audio
-from video_cutter import cut_video_from_transcript, trimmed_path_for
+from transcribe import transcribe_audio
+from video_compressor import compress_video
+from video_cutter import cut_video_from_transcript
 
 VIDEO_FOLDER = "test_videos"
 INPUT_VIDEO = "static_noise.mp4"
 
 
-def output_path_for(input_path: str) -> str:
+def edited_path_for(input_path: str) -> str:
+    """Derive ``<stem>_edited<ext>`` next to the input video."""
     stem, ext = os.path.splitext(input_path)
-    return f"{stem}_audio_denoised{ext}"
+    return f"{stem}_edited{ext}"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Podcast editor: denoise + WhisperX align + silence trim"
-    )
-    parser.add_argument(
-        "--no-denoise",
-        action="store_true",
-        help="Skip denoising; use existing denoised video if present",
-    )
-    parser.add_argument(
-        "--no-transcribe",
-        action="store_true",
-        help="Skip WhisperX transcription/alignment (and silence trim)",
-    )
-    parser.add_argument(
-        "--no-cut",
-        action="store_true",
-        help="Skip silence-gap trimming after alignment",
-    )
-    parser.add_argument(
-        "--model-size",
-        default="medium",
-        help="WhisperX model size (default: medium)",
-    )
-    parser.add_argument(
-        "--language",
-        default=None,
-        help="Force language for ASR + alignment (e.g. en, he). Default: auto-detect",
-    )
-    args = parser.parse_args()
-
     input_path = os.path.join(VIDEO_FOLDER, INPUT_VIDEO)
-    output_video = output_path_for(input_path)
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input video not found: {input_path}")
 
-    if args.no_denoise:
-        if not os.path.exists(output_video):
-            raise FileNotFoundError(
-                f"--no-denoise requires existing file: {output_video}"
-            )
-        print(f"Skipping denoise; using {output_video}")
-    else:
-        denoise_video(input_path, output_video, methods=["static"])
+    final_path = edited_path_for(input_path)
 
-    if args.no_transcribe:
-        print("Skipping transcription (--no-transcribe).")
-        return
+    print("=" * 60)
+    print("[main] Podcast editor pipeline")
+    print(f"[main] Input: {input_path}")
+    print(f"[main] Final output: {final_path}")
+    print("=" * 60)
 
-    # WhisperX: ASR + load_align_model + forced alignment → precise word times.
-    result = transcribe_audio(
-        output_video,
-        model_size=args.model_size,
-        language=args.language,
-    )
-    stem, _ = os.path.splitext(input_path)
-    out_json = f"{stem}_transcript.json"
-    save_transcription_json(result, out_json)
+    # Intermediates live in a temp dir and are deleted when the pipeline finishes.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        denoised_path = os.path.join(tmpdir, "audio_denoised.mp4")
+        trimmed_path = os.path.join(tmpdir, "silence_trimmed.mp4")
 
-    if args.no_cut:
-        print("Skipping silence trim (--no-cut).")
-        return
+        # Step 1 — Denoise
+        print("\n[main] Step 1/4: Denoising audio...")
+        denoise_video(input_path, denoised_path, methods=["static"])
+        print("[main] Step 1/4 done")
 
-    # Pass WhisperX-aligned result dict directly (same data written to JSON).
-    trimmed_video = trimmed_path_for(output_video)
-    cut_video_from_transcript(output_video, result, trimmed_video)
+        # Step 2 — Transcribe + align (keep result in memory; no JSON on disk)
+        print("\n[main] Step 2/4: Transcribing + aligning (WhisperX)...")
+        result = transcribe_audio(denoised_path, model_size="medium", language=None)
+        print("[main] Step 2/4 done")
+
+        # Step 3 — Silence trim
+        print("\n[main] Step 3/4: Cutting silence...")
+        cut_video_from_transcript(denoised_path, result, trimmed_path)
+        print("[main] Step 3/4 done")
+
+        # Step 4 — Compress trimmed video → final edited output
+        print("\n[main] Step 4/4: Compressing trimmed video...")
+        compress_video(
+            trimmed_path,
+            output_path=final_path,
+            codec="libx264",
+            crf=23,
+            preset="slow",
+        )
+        print(f"[main] Step 4/4 done: {final_path}")
+
+    print("\n" + "=" * 60)
+    print(f"[main] Pipeline complete. Edited video: {final_path}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import sys
 import json
 import os
 import subprocess
@@ -365,9 +367,6 @@ def _default_transcript_path(video_path: str) -> str:
 
 
 if __name__ == "__main__":
-    import argparse
-    import sys
-
     parser = argparse.ArgumentParser(
         description="Trim excess silence using WhisperX-aligned transcript JSON."
     )
